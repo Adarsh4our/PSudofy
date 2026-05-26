@@ -1,0 +1,41 @@
+# ─── Music & Downloads ────────────────────────────────────────────────────────
+music/                      # Downloaded music files (can be huge)
+*.mp3
+*.flac
+*.m4a
+*.opus
+*.ogg
+*.wav
+
+# ─── Download Archives ────────────────────────────────────────────────────────
+downloaded_spotify.txt      # spotDL archive (tracks what's been downloaded)
+downloaded_yt.txt           # yt-dlp archive
+
+# ─── Navidrome Data ───────────────────────────────────────────────────────────
+data/                       # Navidrome database, cache, and config
+
+# ─── Python ───────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+.venv/
+venv/
+env/
+*.egg
+
+# ─── Environment / Secrets ────────────────────────────────────────────────────
+.env
+.env.*
+*.secret
+secrets.txt
+
+# ─── OS Clutter ───────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
