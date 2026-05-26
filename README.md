@@ -205,8 +205,4 @@ A: No. spotDL only uses the Spotify API for metadata (song name, artist, album a
 **Q: My music doesn't appear in Navidrome after downloading.**  
 A: PSudofy triggers an auto-scan, but if it fails (Navidrome not running), open `http://localhost:4533` → Settings → Start Scan.
 
----
 
-## 📝 License
-
-MIT — do whatever you want with it.
