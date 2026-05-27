@@ -15,7 +15,6 @@
 [![spotDL](https://img.shields.io/badge/spotDL-latest-1DB954?style=flat&logo=spotify&logoColor=white)](https://github.com/spotDL/spotify-downloader)
 [![Navidrome](https://img.shields.io/badge/Navidrome-latest-FF6600?style=flat)](https://navidrome.org)
 [![Docker](https://img.shields.io/badge/Docker-required-2496ED?style=flat&logo=docker&logoColor=white)](https://docker.com)
-[![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
 *Download from Spotify & YouTube Music. Stream everywhere via Navidrome + Symfonium.*
 

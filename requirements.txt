@@ -1,0 +1,6 @@
+spotdl
+yt-dlp
+rich
+spotapi
+python-dotenv
+ruff

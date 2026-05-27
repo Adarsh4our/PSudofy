@@ -1,5 +1,6 @@
 # ─── Music & Downloads ────────────────────────────────────────────────────────
-music/                      # Downloaded music files (can be huge)
+# Downloaded music files (can be huge)
+music/
 *.mp3
 *.flac
 *.m4a
@@ -8,11 +9,16 @@ music/                      # Downloaded music files (can be huge)
 *.wav
 
 # ─── Download Archives ────────────────────────────────────────────────────────
-downloaded_spotify.txt      # spotDL archive (tracks what's been downloaded)
-downloaded_yt.txt           # yt-dlp archive
+# Download archives (tracks what's been downloaded)
+downloaded_spotify.txt
+downloaded_yt.txt
 
 # ─── Navidrome Data ───────────────────────────────────────────────────────────
-data/                       # Navidrome database, cache, and config
+# Navidrome database, cache, and config
+data/
+
+# ─── Application Logs ─────────────────────────────────────────────────────────
+logs/
 
 # ─── Python ───────────────────────────────────────────────────────────────────
 __pycache__/
