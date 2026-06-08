@@ -16,6 +16,7 @@ downloaded_yt.txt
 # ─── Navidrome Data ───────────────────────────────────────────────────────────
 # Navidrome database, cache, and config
 data/
+backups/*.zip
 
 # ─── Application Logs ─────────────────────────────────────────────────────────
 logs/
