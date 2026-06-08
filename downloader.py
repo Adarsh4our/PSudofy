@@ -7,7 +7,6 @@ Supports Spotify and YouTube Music playlists, albums, and tracks.
 """
 
 import os
-import sys
 import time
 import threading
 import subprocess
@@ -24,9 +23,9 @@ from dotenv import load_dotenv
 
 load_dotenv()  # reads .env from the project root
 
-import yt_dlp
-from rich.console import Console
-from rich.progress import (
+import yt_dlp  # noqa: E402
+from rich.console import Console  # noqa: E402
+from rich.progress import (  # noqa: E402
     Progress,
     SpinnerColumn,
     BarColumn,
@@ -34,12 +33,12 @@ from rich.progress import (
     TimeRemainingColumn,
     MofNCompleteColumn,
 )
-from rich.panel import Panel
-from rich.table import Table
-from rich import box
-from rich.align import Align
-from rich.rule import Rule
-from rich.text import Text
+from rich.panel import Panel  # noqa: E402
+from rich.table import Table  # noqa: E402
+from rich import box  # noqa: E402
+from rich.align import Align  # noqa: E402
+from rich.rule import Rule  # noqa: E402
+from rich.text import Text  # noqa: E402
 
 # ─── Constants ───────────────────────────────────────────────────────────────
 
@@ -494,7 +493,7 @@ def download_spotify(url: str, dry_run: bool = False) -> tuple:
 
     if dry_run:
         console.print(
-            f"[cyan]ℹ️  [bold]Dry Run Mode[/bold] — Pre-scanned Spotify URL[/cyan]\n"
+            "[cyan]ℹ️  [bold]Dry Run Mode[/bold] — Pre-scanned Spotify URL[/cyan]\n"
         )
         if playlist_tracks:
             stats["total"] = len(playlist_tracks)
