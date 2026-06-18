@@ -39,6 +39,7 @@ import smtplib
 import hashlib
 import secrets
 import argparse
+import threading
 import subprocess
 import urllib.parse
 import urllib.request
@@ -971,38 +972,113 @@ def main():
 
     print_banner()
 
-    start_time = time.time()
-    song_stats   = {"downloaded": 0, "skipped": 0, "failed": 0, "total": 0, "_failed_list": []}
+    start_time   = time.time()
+    song_stats   = {"downloaded": 0, "skipped": 0, "failed": 0, "total": 0}
     embed_stats  = {"embedded": 0, "no_file": 0, "failed": 0}
-    failed_songs  = []
-    failed_lyrics = []
+    failed_songs : list = []
+    failed_lyrics: list = []
+    lyrics_data  : dict = {}
 
-    # ── Step 1: Download songs on server ─────────────────────────────────────
-    if not args.skip_songs:
-        song_stats  = download_songs_locally_and_upload(args.url, dry_run=args.dry_run)
-        failed_songs = song_stats.pop("_failed_list", [])
-    else:
-        console.print("[dim]ℹ️  Skipping song download (--skip-songs)[/dim]")
+    # Shared console lock so parallel threads don't interleave mid-line
+    _lock = threading.Lock()
 
-    # ── Step 2: Check only playlist songs for missing lyrics ────────────────────
-    if not args.skip_lyrics and not args.dry_run:
-        missing_songs, already_have = get_playlist_songs_missing_lyrics(args.url)
+    def _print(msg: str, prefix: str = ""):
+        """Thread-safe console print with optional prefix."""
+        with _lock:
+            console.print(f"{prefix}{msg}" if prefix else msg)
 
-        # ── Step 3: Fetch lyrics on local PC ─────────────────────────────────
-        lyrics_data = fetch_lyrics_locally(missing_songs)
+    # ─────────────────────────────────────────────────────────────────────────
+    # Normal mode: run DOWNLOAD and LYRICS FETCH in parallel
+    # ─────────────────────────────────────────────────────────────────────────
+    if not args.skip_songs and not args.skip_lyrics and not args.dry_run:
+
+        console.print()
+        console.print(Rule(
+            "[bold cyan]⚡ Parallel Mode: Songs + Lyrics simultaneously[/bold cyan]",
+            style="cyan",
+        ))
+        console.print(
+            "  [bold cyan]🎵 Download[/bold cyan]  ·  downloading playlist to your PC then uploading to server\n"
+            "  [bold cyan]📝 Lyrics  [/bold cyan]  ·  fetching lyrics from lrclib + Genius simultaneously\n"
+        )
+
+        _song_result  : dict = {}
+        _lyrics_result: dict = {}
+
+        # ── Thread A: download songs locally then scp to server ───────────────
+        def _download_worker():
+            result = download_songs_locally_and_upload(args.url, dry_run=False)
+            _song_result.update(result)
+
+        # ── Thread B: fetch playlist track list then fetch lyrics locally ─────
+        def _lyrics_worker():
+            with _lock:
+                console.print("[bold cyan]📝 Lyrics   :[/bold cyan]  Fetching track list from playlist…")
+            tracks = get_playlist_tracks(args.url)
+            if not tracks:
+                with _lock:
+                    console.print("[yellow]📝 Lyrics   :[/yellow]  Could not fetch track list — skipping lyrics.")
+                return
+            with _lock:
+                console.print(
+                    f"[bold cyan]📝 Lyrics   :[/bold cyan]  "
+                    f"[bold cyan]{len(tracks)}[/bold cyan] tracks found — fetching lyrics…"
+                )
+            data = fetch_lyrics_locally(tracks)
+            _lyrics_result.update(data)
+
+        t_songs  = threading.Thread(target=_download_worker, name="DownloadThread",  daemon=True)
+        t_lyrics = threading.Thread(target=_lyrics_worker,   name="LyricsThread",    daemon=True)
+
+        t_songs.start()
+        t_lyrics.start()
+
+        t_songs.join()
+        t_lyrics.join()
+
+        song_stats    = _song_result
+        lyrics_data   = _lyrics_result
+        failed_songs  = song_stats.pop("_failed_list", [])
         failed_lyrics = lyrics_data.pop("_meta_failed", [])
 
-        # ── Step 4: Upload + embed on server ─────────────────────────────────
+        # Songs already uploaded by _download_worker — now embed lyrics
+        console.print()
+        console.print(Rule("[bold cyan]Step 3 · Embed Lyrics on Server[/bold cyan]", style="cyan"))
+        console.print()
         embed_stats = upload_and_embed_lyrics(lyrics_data)
 
+    # ─────────────────────────────────────────────────────────────────────────
+    # Songs-only mode
+    # ─────────────────────────────────────────────────────────────────────────
+    elif args.skip_lyrics:
+        if args.dry_run:
+            console.print("[dim]ℹ️  Dry Run — would download songs only.[/dim]")
+        else:
+            song_stats   = download_songs_locally_and_upload(args.url, dry_run=False)
+            failed_songs = song_stats.pop("_failed_list", [])
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Lyrics-only mode
+    # ─────────────────────────────────────────────────────────────────────────
+    elif args.skip_songs:
+        if args.dry_run:
+            console.print("[dim]ℹ️  Dry Run — would fetch lyrics only.[/dim]")
+        else:
+            tracks        = get_playlist_tracks(args.url)
+            lyrics_data   = fetch_lyrics_locally(tracks)
+            failed_lyrics = lyrics_data.pop("_meta_failed", [])
+            embed_stats   = upload_and_embed_lyrics(lyrics_data)
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Dry-run mode (both steps skipped)
+    # ─────────────────────────────────────────────────────────────────────────
     elif args.dry_run:
-        console.print("[dim]ℹ️  Dry Run — skipping lyrics and embed steps.[/dim]")
-    else:
-        console.print("[dim]ℹ️  Skipping lyrics (--skip-lyrics)[/dim]")
+        download_songs_locally_and_upload(args.url, dry_run=True)
+        console.print("[dim]ℹ️  Dry Run — skipping lyrics fetch and embed.[/dim]")
 
     # ── Navidrome rescan ──────────────────────────────────────────────────────
     console.print()
-    console.print(Rule("[bold cyan]Step 5 · Navidrome Rescan[/bold cyan]", style="cyan"))
+    console.print(Rule("[bold cyan]Navidrome Rescan[/bold cyan]", style="cyan"))
     console.print()
     if not args.dry_run:
         trigger_navidrome_scan()
