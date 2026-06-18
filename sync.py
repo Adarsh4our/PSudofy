@@ -44,6 +44,7 @@ import subprocess
 import urllib.parse
 import urllib.request
 import urllib.error
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
@@ -203,17 +204,19 @@ REMOTE_MUSIC_PATH  = f"{SSH_HOST}:{REMOTE_DIR}/music/"
 
 
 def _scp_upload_dir(local_dir: str, remote_path: str):
-    """Upload an entire local directory to the server recursively via scp."""
+    """Upload an entire local directory to the server recursively via scp (quiet)."""
     subprocess.run(
         [
             "scp",
             "-i", SSH_KEY_PATH,
             "-o", "StrictHostKeyChecking=no",
             "-r",
+            "-q",  # suppress per-file progress
             local_dir,
             remote_path,
         ],
         check=True,
+        capture_output=True,
     )
 
 
@@ -327,8 +330,7 @@ def download_songs_locally_and_upload(url: str, dry_run: bool = False) -> dict:
                 failed_songs.append(name)
                 console.print(f"  [red]❌[/red] Failed: {name}")
             elif "downloading" in line_lower and '"' in line:
-                name = line.split('"')[1]
-                console.print(f"  [cyan]⟳[/cyan]  [italic]{name}[/italic]")
+                pass  # suppress live status — causes messy interleaving in parallel mode
         else:
             if "error" in line_lower or "unable" in line_lower:
                 stats["failed"] += 1
@@ -347,7 +349,7 @@ def download_songs_locally_and_upload(url: str, dry_run: bool = False) -> dict:
     if stats["total"] == 0:
         stats["total"] = stats["downloaded"] + stats["skipped"] + stats["failed"]
 
-    # ── Upload new artist folders to server ───────────────────────────────────
+    # ── Upload new artist folders to server (in parallel) ─────────────────────
     if new_files:
         # Find which artist folders contain new files
         new_artist_dirs = set()
@@ -357,21 +359,35 @@ def download_songs_locally_and_upload(url: str, dry_run: bool = False) -> dict:
 
         console.print(
             f"\n[cyan]⟳[/cyan]  Uploading [bold cyan]{len(new_files)}[/bold cyan] new songs "
-            f"from [bold cyan]{len(new_artist_dirs)}[/bold cyan] artist folder(s) to server…"
+            f"from [bold cyan]{len(new_artist_dirs)}[/bold cyan] artist folder(s) to server "
+            f"[dim](⚡ {min(4, len(new_artist_dirs))} parallel uploads)[/dim]"
         )
-        upload_ok = True
-        for artist_dir in sorted(new_artist_dirs):
+
+        upload_failed = []
+
+        def _upload_one(artist_dir: str) -> Tuple[str, bool, str]:
             artist_name = os.path.basename(artist_dir)
             try:
                 _scp_upload_dir(artist_dir, REMOTE_MUSIC_PATH)
-                console.print(f"  [green]✅[/green] Uploaded: [bold]{artist_name}[/bold]")
+                return artist_name, True, ""
             except subprocess.CalledProcessError as e:
-                upload_ok = False
-                console.print(f"  [red]❌[/red] Upload failed for [bold]{artist_name}[/bold]: [dim]{e}[/dim]")
-                failed_songs.append(f"[upload] {artist_name}")
+                return artist_name, False, str(e)
 
-        if upload_ok:
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            futures = {executor.submit(_upload_one, d): d for d in sorted(new_artist_dirs)}
+            for future in as_completed(futures):
+                artist_name, ok, err = future.result()
+                if ok:
+                    console.print(f"  [green]✅[/green] Uploaded: [bold]{artist_name}[/bold]")
+                else:
+                    console.print(f"  [red]❌[/red] Upload failed: [bold]{artist_name}[/bold] [dim]{err}[/dim]")
+                    upload_failed.append(artist_name)
+                    failed_songs.append(f"[upload] {artist_name}")
+
+        if not upload_failed:
             console.print(f"[cyan]✓[/cyan]  All new songs uploaded to server.")
+        else:
+            console.print(f"[yellow]⚠️[/yellow]  {len(upload_failed)} folder(s) failed to upload.")
     else:
         console.print(
             "[yellow]ℹ️[/yellow]  No new songs downloaded — "
