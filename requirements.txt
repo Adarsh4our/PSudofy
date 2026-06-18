@@ -5,3 +5,4 @@ spotapi
 python-dotenv
 ruff
 mutagen
+beautifulsoup4
