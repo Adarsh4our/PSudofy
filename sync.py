@@ -39,7 +39,6 @@ import smtplib
 import hashlib
 import secrets
 import argparse
-import tempfile
 import subprocess
 import urllib.parse
 import urllib.request
@@ -315,10 +314,10 @@ def download_songs_on_server(url: str, dry_run: bool = False) -> dict:
     return stats
 
 
-# ── Step 2: Get Songs Missing Lyrics from Server ──────────────────────────────
+# ── Step 2: Get Playlist Tracks & Filter to Missing Lyrics ───────────────────
 
-# Python script that runs on the server to list songs missing lyrics
-_SCAN_SCRIPT = r"""
+# Script uploaded to server: checks if a specific set of songs have lyrics
+_CHECK_SCRIPT_TPL = """
 import os, json, sys
 from pathlib import Path
 try:
@@ -326,77 +325,175 @@ try:
 except ImportError:
     print("ERROR:mutagen_not_installed")
     sys.exit(1)
-try:
-    from mutagen.mp3 import MP3
-except ImportError:
-    pass
 
 music_root = Path(os.path.expanduser("~/PSudofy/music"))
-missing = []
-found   = 0
 
+# Songs to check (injected by sync.py)
+songs_to_check = {songs_json}
+
+# Build a map: normalised (title, artist) -> path for all MP3s on server
+server_map = {{}}
 for mp3 in music_root.rglob("*.mp3"):
     try:
         tags = ID3(str(mp3))
-        has_lyrics = bool(tags.getall("USLT") or tags.getall("SYLT"))
-        title  = str(tags.get("TIT2", ""))
-        artist = str(tags.get("TPE1", ""))
-        if has_lyrics:
-            found += 1
-        else:
-            missing.append({"title": title, "artist": artist, "path": str(mp3)})
+        t = str(tags.get("TIT2", "")).strip().lower()
+        a = str(tags.get("TPE1", "")).strip().lower()
+        if t:
+            server_map[(t, a)] = {{"path": str(mp3), "title": str(tags.get("TIT2", "")), "artist": str(tags.get("TPE1", ""))}}
     except (ID3NoHeaderError, Exception):
         pass
 
-print(json.dumps({"missing": missing, "found_count": found}))
+missing = []
+found   = 0
+
+for song in songs_to_check:
+    t = song.get("title", "").strip().lower()
+    a = song.get("artist", "").strip().lower()
+    entry = server_map.get((t, a)) or server_map.get((t, ""))
+    if not entry:
+        continue  # not on server yet (might still be downloading)
+    try:
+        tags = ID3(entry["path"])
+        has_lyrics = bool(tags.getall("USLT") or tags.getall("SYLT"))
+        if has_lyrics:
+            found += 1
+        else:
+            missing.append({{"title": entry["title"], "artist": entry["artist"], "path": entry["path"]}})
+    except Exception:
+        pass
+
+print(json.dumps({{"missing": missing, "found_count": found}}))
 """
 
 
-def get_songs_missing_lyrics() -> Tuple[list, int]:
+def get_playlist_tracks(url: str) -> list:
     """
-    SSH into server, scan all MP3 ID3 tags, and return:
-      - list of dicts with title/artist for songs missing lyrics
-      - count of songs that already have lyrics
+    Fetch track list (title, artist) from a Spotify or YouTube playlist URL.
+    Returns list of dicts: [{"title": ..., "artist": ...}, ...]
+    """
+    tracks = []
+    is_spotify = "spotify.com" in url
+    is_youtube = "youtube.com" in url or "youtu.be" in url
+
+    if is_spotify:
+        try:
+            import spotapi  # type: ignore
+            if "playlist/" in url:
+                playlist_id = url.split("playlist/")[-1].split("?")[0]
+                pub = spotapi.PublicPlaylist(playlist_id)
+                for chunk in pub.paginate_playlist():
+                    for item in chunk.get("items", []):
+                        try:
+                            td  = item.get("itemV3", {}).get("data", {})
+                            uri = td.get("uri", "")
+                            if not uri.startswith("spotify:track:"):
+                                continue
+                            name = td.get("name", "") or td.get("identityTrait", {}).get("name", "")
+                            contributors = td.get("artists", {}).get("items", []) or td.get("identityTrait", {}).get("contributors", {}).get("items", [])
+                            artist = ""
+                            if contributors:
+                                p = contributors[0].get("profile", {})
+                                artist = p.get("name", "") if p else contributors[0].get("name", "")
+                            if name:
+                                tracks.append({"title": name, "artist": artist})
+                        except Exception:
+                            pass
+            elif "album/" in url:
+                album_id = url.split("album/")[-1].split("?")[0]
+                pub = spotapi.PublicAlbum(album_id)
+                for chunk in pub.paginate_album():
+                    for item in chunk.get("items", []):
+                        try:
+                            name   = item.get("name", "")
+                            artists = item.get("artists", {}).get("items", [])
+                            artist = artists[0].get("profile", {}).get("name", "") if artists else ""
+                            if name:
+                                tracks.append({"title": name, "artist": artist})
+                        except Exception:
+                            pass
+            elif "track/" in url:
+                # Single track — can't easily prefetch name without API, return placeholder
+                tracks.append({"title": "Unknown", "artist": ""})
+        except Exception as e:
+            console.print(f"[yellow]⚠️[/yellow]  Could not prefetch Spotify tracks: [dim]{e}[/dim]")
+
+    elif is_youtube:
+        try:
+            import yt_dlp  # type: ignore
+            flat_opts = {"quiet": True, "extract_flat": True, "skip_download": True}
+            with yt_dlp.YoutubeDL(flat_opts) as ydl:
+                info = ydl.extract_info(url, download=False)
+            entries = info.get("entries", [info]) if info.get("_type") == "playlist" else [info]
+            for e in entries:
+                if e:
+                    tracks.append({"title": e.get("title", ""), "artist": e.get("uploader", "")})
+        except Exception as e:
+            console.print(f"[yellow]⚠️[/yellow]  Could not prefetch YouTube tracks: [dim]{e}[/dim]")
+
+    return tracks
+
+
+def get_playlist_songs_missing_lyrics(url: str) -> Tuple[list, int]:
+    """
+    Fetch the playlist track list, then SSH into server and check only those
+    songs for missing lyrics — much faster than scanning all 978 MP3s.
+    Returns (missing_songs list, already_have count).
     """
     console.print()
-    console.print(Rule("[bold cyan]Step 2 · Scan Server for Missing Lyrics[/bold cyan]", style="cyan"))
+    console.print(Rule("[bold cyan]Step 2 · Check Playlist Songs for Lyrics[/bold cyan]", style="cyan"))
     console.print()
-    console.print("[cyan]⟳[/cyan]  Scanning MP3 files on server for missing lyrics…")
 
-    # Write the scan script to a temp file and upload it
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False, encoding="utf-8") as tmp:
-        tmp.write(_SCAN_SCRIPT)
-        tmp_path = tmp.name
+    # 1. Get track list from the playlist URL
+    console.print("[cyan]⟳[/cyan]  Fetching track list from playlist…")
+    playlist_tracks = get_playlist_tracks(url)
 
+    if not playlist_tracks:
+        console.print("[yellow]⚠️[/yellow]  Could not fetch playlist tracks — skipping lyrics check.")
+        return [], 0
+
+    console.print(
+        f"[cyan]✓[/cyan]  Playlist has [bold cyan]{len(playlist_tracks)}[/bold cyan] tracks  "
+        f"[dim]· checking which ones are missing lyrics on server…[/dim]"
+    )
+
+    # 2. Upload a targeted check script to the server
+    songs_json = json.dumps(playlist_tracks)
+    check_script = _CHECK_SCRIPT_TPL.replace("{songs_json}", songs_json)
+
+    LOCAL_DATA_DIR.mkdir(exist_ok=True)
+    tmp_path = str(LOCAL_DATA_DIR / "_check_lyrics.py")
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        f.write(check_script)
+
+    remote_check_path = f"{REMOTE_DIR}/_check_lyrics.py"
     try:
-        remote_scan_path = f"{REMOTE_DIR}/_scan_lyrics.py"
-        scp_upload(tmp_path, remote_scan_path)
+        scp_upload(tmp_path, remote_check_path)
     finally:
         os.unlink(tmp_path)
 
-    result = ssh_run(f"python3 {remote_scan_path} && rm -f {remote_scan_path}")
+    result = ssh_run(f"python3 {remote_check_path} && rm -f {remote_check_path}")
 
     if result.returncode != 0 or not result.stdout.strip():
-        console.print(f"[red]❌  Failed to scan server:[/red] {result.stderr[:200]}")
-        return [], 0
+        console.print(f"[red]❌  Failed to check server:[/red] {result.stderr[:200]}")
+        # Fallback: return all playlist tracks as missing (so we at least try to fetch)
+        return playlist_tracks, 0
 
     try:
-        # Find the JSON line in stdout (ignore any print noise)
         for line in result.stdout.splitlines():
             line = line.strip()
             if line.startswith("{"):
-                data = json.loads(line)
+                data    = json.loads(line)
                 missing = data.get("missing", [])
                 found   = data.get("found_count", 0)
                 console.print(
-                    f"[cyan]✓[/cyan]  [bold cyan]{len(missing)}[/bold cyan] songs missing lyrics  "
+                    f"[cyan]✓[/cyan]  [bold cyan]{len(missing)}[/bold cyan] songs in playlist missing lyrics  "
                     f"[dim]·  {found} already have lyrics[/dim]"
                 )
                 return missing, found
     except Exception as e:
-        console.print(f"[red]❌  Could not parse scan output:[/red] {e}")
+        console.print(f"[red]❌  Could not parse check output:[/red] {e}")
 
-    return [], 0
+    return playlist_tracks, 0
 
 
 # ── Step 3: Fetch Lyrics Locally ──────────────────────────────────────────────
@@ -551,7 +648,8 @@ def fetch_lyrics_locally(missing_songs: list) -> dict:
             continue
 
         label = f"{title} — {_primary_artist(artist)}" if artist else title
-        console.print(f"  [{i}/{total}] {label}", end=" ", flush=True)
+        console.print(f"  [{i}/{total}] {label}", end=" ")
+        sys.stdout.flush()
 
         plain, synced, source = None, None, None
 
@@ -819,9 +917,9 @@ def main():
     else:
         console.print("[dim]ℹ️  Skipping song download (--skip-songs)[/dim]")
 
-    # ── Step 2: Scan server for songs missing lyrics ──────────────────────────
+    # ── Step 2: Check only playlist songs for missing lyrics ────────────────────
     if not args.skip_lyrics and not args.dry_run:
-        missing_songs, already_have = get_songs_missing_lyrics()
+        missing_songs, already_have = get_playlist_songs_missing_lyrics(args.url)
 
         # ── Step 3: Fetch lyrics on local PC ─────────────────────────────────
         lyrics_data = fetch_lyrics_locally(missing_songs)
