@@ -39,6 +39,7 @@ env/
 # ─── Environment / Secrets ────────────────────────────────────────────────────
 .env
 .env.*
+!.env.example
 *.secret
 secrets.txt
 
