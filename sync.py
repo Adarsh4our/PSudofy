@@ -191,71 +191,126 @@ def trigger_navidrome_scan() -> bool:
         return False
 
 
-# ── Step 1: Download Songs on Server ─────────────────────────────────────────
+# ── Step 1: Download Songs Locally + Upload to Server ────────────────────────
+#
+# spotdl requires Python 3.9+ (curl_cffi constraint) and cannot be installed on
+# the Oracle server which runs Python 3.8.  We therefore download on the local
+# PC (where spotdl/yt-dlp are already working) then rsync/scp the new files up.
 
-def download_songs_on_server(url: str, dry_run: bool = False) -> dict:
+LOCAL_MUSIC_FOLDER = os.getenv("LOCAL_MUSIC_FOLDER", os.path.join(os.path.dirname(os.path.abspath(__file__)), "music"))
+REMOTE_MUSIC_PATH  = f"{SSH_HOST}:{REMOTE_DIR}/music/"
+
+
+def _scp_upload_dir(local_dir: str, remote_path: str):
+    """Upload an entire local directory to the server recursively via scp."""
+    subprocess.run(
+        [
+            "scp",
+            "-i", SSH_KEY_PATH,
+            "-o", "StrictHostKeyChecking=no",
+            "-r",
+            local_dir,
+            remote_path,
+        ],
+        check=True,
+    )
+
+
+def download_songs_locally_and_upload(url: str, dry_run: bool = False) -> dict:
     """
-    SSH into the Oracle server and run spotdl / yt-dlp to download the playlist
-    directly there. Returns a stats dict.
+    Download the playlist locally using spotdl / yt-dlp (already installed on
+    this PC), then scp any new artist folders to the Oracle server.
+    Returns a stats dict.
     """
     console.print()
-    console.print(Rule("[bold cyan]Step 1 · Download Songs on Server[/bold cyan]", style="cyan"))
+    console.print(Rule("[bold cyan]Step 1 · Download Songs Locally → Upload to Server[/bold cyan]", style="cyan"))
     console.print()
 
     stats = {"downloaded": 0, "skipped": 0, "failed": 0, "total": 0}
-    failed_songs = []
+    failed_songs: list = []
 
     is_spotify = "spotify.com" in url
     is_youtube = "youtube.com" in url or "youtu.be" in url
 
     if not is_spotify and not is_youtube:
         console.print("[red]❌  Unsupported URL.[/red] Please provide a Spotify or YouTube Music link.")
+        stats["_failed_list"] = failed_songs
         return stats
 
     if dry_run:
-        console.print(f"[cyan]ℹ️  Dry Run — would download:[/cyan] [bold]{url}[/bold]")
+        console.print(f"[cyan]ℹ️  Dry Run — would download locally then upload:[/cyan] [bold]{url}[/bold]")
+        stats["_failed_list"] = failed_songs
         return stats
 
+    os.makedirs(LOCAL_MUSIC_FOLDER, exist_ok=True)
+
+    # ── Snapshot of existing local files before download ─────────────────────
+    def _local_mp3s() -> set:
+        result = set()
+        for root, _, files in os.walk(LOCAL_MUSIC_FOLDER):
+            for f in files:
+                if f.endswith(".mp3"):
+                    result.add(os.path.join(root, f))
+        return result
+
+    before = _local_mp3s()
+
+    # ── Build download command ────────────────────────────────────────────────
     if is_spotify:
-        output_template = f"{REMOTE_DIR}/music/{{artist}}/{{title}} - {{artist}}.{{ext}}"
-        archive_path    = f"{REMOTE_DIR}/downloaded_spotify.txt"
-        cmd = (
-            f"cd {REMOTE_DIR} && "
-            f"spotdl download '{url}' "
-            f"--output '{output_template}' "
-            f"--archive {archive_path} "
-            f"--threads 4"
-        )
+        archive_file    = os.path.join(os.path.dirname(os.path.abspath(__file__)), "downloaded_spotify.txt")
+        output_template = os.path.join(LOCAL_MUSIC_FOLDER, "{artist}", "{title} - {artist}.{ext}")
+        cmd = [
+            "spotdl", "download", url,
+            "--output", output_template,
+            "--archive", archive_file,
+            "--threads", "4",
+        ]
+        source_label = "Spotify (spotdl)"
     else:
-        output_template = f"{REMOTE_DIR}/music/%(artist,uploader)s/%(title)s.%(ext)s"
-        archive_path    = f"{REMOTE_DIR}/downloaded_yt.txt"
-        cmd = (
-            f"cd {REMOTE_DIR} && "
-            f"yt-dlp --format bestaudio/best "
-            f"--postprocessors '[{{\"key\":\"FFmpegExtractAudio\",\"preferredcodec\":\"mp3\",\"preferredquality\":\"0\"}},{{\"key\":\"FFmpegMetadata\"}},{{\"key\":\"EmbedThumbnail\"}}]' "
-            f"--write-thumbnail "
-            f"--output '{output_template}' "
-            f"--download-archive {archive_path} "
-            f"--quiet --no-warnings "
-            f"'{url}'"
-        )
+        archive_file    = os.path.join(os.path.dirname(os.path.abspath(__file__)), "downloaded_yt.txt")
+        output_template = os.path.join(LOCAL_MUSIC_FOLDER, "%(artist,uploader)s", "%(title)s.%(ext)s")
+        cmd = [
+            "yt-dlp",
+            "--format", "bestaudio/best",
+            "--extract-audio", "--audio-format", "mp3", "--audio-quality", "0",
+            "--embed-thumbnail",
+            "--add-metadata",
+            "--output", output_template,
+            "--download-archive", archive_file,
+            "--quiet", "--no-warnings",
+            url,
+        ]
+        source_label = "YouTube (yt-dlp)"
 
-    console.print(f"[cyan]⟳[/cyan]  Connecting to server and starting download…")
-    console.print(f"[dim]  Source: {'Spotify (spotdl)' if is_spotify else 'YouTube (yt-dlp)'}[/dim]\n")
+    console.print(f"[cyan]⟳[/cyan]  Downloading locally…  [dim]Source: {source_label}[/dim]\n")
 
-    for line in ssh_stream_lines(cmd):
+    env = os.environ.copy()
+    env["COLUMNS"] = "10000"
+    env["TERM"]    = "dumb"
+
+    process = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        bufsize=1,
+        env=env,
+    )
+
+    for raw_line in process.stdout:
+        line       = raw_line.strip()
         line_lower = line.lower()
-
-        if not line.strip():
+        if not line:
             continue
 
-        # ── Spotify parsing ───────────────────────────────────────────────
         if is_spotify:
             if "found" in line_lower and "song" in line_lower:
                 for word in line.split():
                     if word.isdigit():
                         stats["total"] = int(word)
-                        console.print(f"[cyan]✓[/cyan]  Found [bold cyan]{stats['total']}[/bold cyan] songs in playlist\n")
+                        console.print(f"[cyan]✓[/cyan]  Found [bold cyan]{stats['total']}[/bold cyan] songs\n")
                         break
             elif line_lower.startswith("downloaded") or ("downloaded" in line_lower and '"' in line):
                 name = line.split('"')[1] if '"' in line else line
@@ -264,7 +319,7 @@ def download_songs_on_server(url: str, dry_run: bool = False) -> dict:
             elif "skipping" in line_lower:
                 name = re.sub(r"(?i)^skipping\s+", "", line).strip(' "')
                 stats["skipped"] += 1
-                console.print(f"  [yellow]⚠️[/yellow]  Skipped: [dim]{name}[/dim]")
+                console.print(f"  [yellow]⚠️[/yellow]  Skipped (already have): [dim]{name}[/dim]")
             elif "failed" in line_lower and "fetch secrets" not in line_lower and "thetadev" not in line_lower:
                 name = line.split('"')[1] if '"' in line else line
                 stats["failed"] += 1
@@ -272,43 +327,55 @@ def download_songs_on_server(url: str, dry_run: bool = False) -> dict:
                 console.print(f"  [red]❌[/red] Failed: {name}")
             elif "downloading" in line_lower and '"' in line:
                 name = line.split('"')[1]
-                console.print(f"  [cyan]⟳[/cyan]  Downloading: [italic]{name}[/italic]")
-
-        # ── YouTube parsing ───────────────────────────────────────────────
+                console.print(f"  [cyan]⟳[/cyan]  [italic]{name}[/italic]")
         else:
-            if "[download]" in line_lower and "%" in line:
-                console.print(f"  [cyan]⟳[/cyan]  [dim]{line}[/dim]")
-            elif "error" in line_lower or "unable" in line_lower:
+            if "error" in line_lower or "unable" in line_lower:
                 stats["failed"] += 1
                 failed_songs.append(line[:80])
                 console.print(f"  [red]❌[/red] {line[:80]}")
-            elif line.strip():
+            elif line:
                 console.print(f"  [dim]{line}[/dim]")
 
+    process.wait()
+
+    # ── Detect newly downloaded files ─────────────────────────────────────────
+    after    = _local_mp3s()
+    new_files = after - before
+    if stats["downloaded"] == 0:
+        stats["downloaded"] = len(new_files)
     if stats["total"] == 0:
         stats["total"] = stats["downloaded"] + stats["skipped"] + stats["failed"]
 
-    # Retry failed (once)
-    if failed_songs:
-        console.print(f"\n[yellow]⚠️[/yellow]  {len(failed_songs)} songs failed. Retrying once…\n")
-        retry_failed = []
-        for song in failed_songs:
-            # For Spotify retry just re-run the URL — spotdl skips already downloaded
-            if is_spotify:
-                retry_cmd = (
-                    f"cd {REMOTE_DIR} && spotdl download '{url}' "
-                    f"--output '{output_template}' --archive {archive_path} --threads 2"
-                )
-                result = ssh_run(retry_cmd)
-                if "downloaded" in result.stdout.lower():
-                    stats["downloaded"] += 1
-                    stats["failed"] -= 1
-                    console.print(f"  [green]✅[/green] Retry success: {song}")
-                else:
-                    retry_failed.append(song)
-            else:
-                retry_failed.append(song)  # yt-dlp retries are complex; log for email
-        failed_songs = retry_failed
+    # ── Upload new artist folders to server ───────────────────────────────────
+    if new_files:
+        # Find which artist folders contain new files
+        new_artist_dirs = set()
+        for f in new_files:
+            artist_dir = os.path.dirname(f)
+            new_artist_dirs.add(artist_dir)
+
+        console.print(
+            f"\n[cyan]⟳[/cyan]  Uploading [bold cyan]{len(new_files)}[/bold cyan] new songs "
+            f"from [bold cyan]{len(new_artist_dirs)}[/bold cyan] artist folder(s) to server…"
+        )
+        upload_ok = True
+        for artist_dir in sorted(new_artist_dirs):
+            artist_name = os.path.basename(artist_dir)
+            try:
+                _scp_upload_dir(artist_dir, REMOTE_MUSIC_PATH)
+                console.print(f"  [green]✅[/green] Uploaded: [bold]{artist_name}[/bold]")
+            except subprocess.CalledProcessError as e:
+                upload_ok = False
+                console.print(f"  [red]❌[/red] Upload failed for [bold]{artist_name}[/bold]: [dim]{e}[/dim]")
+                failed_songs.append(f"[upload] {artist_name}")
+
+        if upload_ok:
+            console.print(f"[cyan]✓[/cyan]  All new songs uploaded to server.")
+    else:
+        console.print(
+            "[yellow]ℹ️[/yellow]  No new songs downloaded — "
+            "[dim]all songs in this playlist are already in your local archive.[/dim]"
+        )
 
     stats["_failed_list"] = failed_songs
     return stats
@@ -912,7 +979,7 @@ def main():
 
     # ── Step 1: Download songs on server ─────────────────────────────────────
     if not args.skip_songs:
-        song_stats  = download_songs_on_server(args.url, dry_run=args.dry_run)
+        song_stats  = download_songs_locally_and_upload(args.url, dry_run=args.dry_run)
         failed_songs = song_stats.pop("_failed_list", [])
     else:
         console.print("[dim]ℹ️  Skipping song download (--skip-songs)[/dim]")
