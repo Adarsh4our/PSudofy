@@ -46,11 +46,14 @@ No subscription. No ads. Your music, your server.
 | **FFmpeg** | Audio conversion | [ffmpeg.org](https://ffmpeg.org) |
 | **Rich** | Beautiful terminal UI | `pip install rich` |
 | **spotapi** | Playlist pre-scan | `pip install spotapi` |
+| **python-dotenv** | Configuration manager | `pip install python-dotenv` |
+| **mutagen** | Embed lyrics / tag editor | `pip install mutagen` |
+| **beautifulsoup4** | Scraping lyrics | `pip install beautifulsoup4` |
 
 ### Install all Python dependencies at once
 
 ```bash
-pip install spotdl yt-dlp rich spotapi
+pip install spotdl yt-dlp rich spotapi python-dotenv mutagen beautifulsoup4
 ```
 
 ---
@@ -184,6 +187,58 @@ By default, PSudofy + Navidrome only works on your **home Wi-Fi**. To stream fro
 
 ### Offline Listening
 In Symfonium, long-press any playlist/album → **Download** → songs saved to phone storage → play without internet or PC.
+
+---
+
+## 🔄 One-Command Remote Sync (`sync.py`)
+
+For self-hosted remote servers (e.g. Oracle Cloud, VPS), `sync.py` provides a complete, automated pipeline to:
+1. **Download locally**: Fetches playlist tracks in parallel on your PC (to run latest spotdl/yt-dlp).
+2. **Fetch Lyrics**: Queries `lrclib.net` and Genius locally to bypass Cloudflare blocks on VPS/server IPs.
+3. **Upload to Server**: SCPs new folders and files to your remote Navidrome server (uses multithreading for fast uploads).
+4. **Embed Lyrics**: Runs a remote worker to inject lyrics directly into ID3 tags.
+5. **Navidrome Update**: Triggers a subsonic API rescan on the server immediately.
+6. **Notification**: Emails you a rich summary sync report (via Gmail App Passwords).
+
+### Setup
+
+1. Copy `.env.example` to `.env` and fill in your SSH host, private key path, Navidrome credentials, and notification settings:
+   ```env
+   SSH_KEY_PATH=C:\path\to\your\ssh-key.key
+   SSH_HOST=ubuntu@123.45.67.89
+   REMOTE_DIR=~/PSudofy
+   MUSIC_FOLDER=./music
+   NAVIDROME_URL=http://123.45.67.89:4533
+   NAVI_USER=admin
+   NAVI_PASS=password
+   NOTIFY_EMAIL_FROM=yourgmail@gmail.com
+   NOTIFY_EMAIL_TO=recipient@gmail.com
+   NOTIFY_EMAIL_PASS=xxxx xxxx xxxx xxxx
+   ```
+
+2. Run the sync:
+   ```bash
+   python sync.py "https://open.spotify.com/playlist/..."
+   ```
+
+---
+
+## ⚖️ Bidirectional Library Sync (`sync_libraries.py`)
+
+If you want to ensure all songs are identical between your local PC and your remote server (e.g., retrieving files synced directly on the server, or uploading manually downloaded local songs), use `sync_libraries.py`.
+
+It runs a safe, 5-step bidirectional sync process:
+1. Identifies differences and uploads any unique local files (or re-uploads corrupted/truncated remote files).
+2. Packages the entire remote music directory into a single archive (`music_sync.tar`) on the server.
+3. Downloads the archive to your PC in a single fast stream (with keep-alive and retry logic).
+4. Extracts the archive locally, automatically matching all songs, folder structures, and embedding latest remote lyrics.
+5. Cleans up temporary archives on both sides and verifies 100% library parity.
+
+### Run Sync
+
+```bash
+python sync_libraries.py
+```
 
 ---
 
