@@ -575,7 +575,7 @@ def embed_lyrics_to_file(mp3_path: str, plain: str | None, synced: str | None, t
 
 # ─────────────────────────────── Downloader ───────────────────────────────────
 
-def _build_ydl_opts(progress_hook=None) -> dict:
+def _build_ydl_opts(progress_hook=None, ignore_errors: bool = True, logger=None) -> dict:
     opts = {
         "format": "bestaudio/best",
         "postprocessors": [
@@ -588,9 +588,11 @@ def _build_ydl_opts(progress_hook=None) -> dict:
         "writethumbnail":     True,
         "quiet":              True,
         "no_warnings":        True,
-        "ignoreerrors":       True,   # skip unavailable playlist items
+        "ignoreerrors":       ignore_errors,
         "extract_flat":       False,
     }
+    if logger:
+        opts["logger"] = logger
     if os.path.exists(COOKIES_PATH):
         opts["cookiefile"] = COOKIES_PATH
     if progress_hook:
@@ -622,7 +624,7 @@ def process_single_entry(ydl, entry: dict | None) -> dict:
     }
 
 
-YT_BOT_PHRASES = ["Sign in to confirm", "bot", "cookies", "not a bot"]
+YT_BOT_PHRASES = ["Sign in to confirm", "bot", "cookies", "not a bot", "automated queries", "captcha"]
 
 def _is_yt_blocked(err: str) -> bool:
     return any(p.lower() in err.lower() for p in YT_BOT_PHRASES)
@@ -647,11 +649,25 @@ def run_single_download(query: str) -> dict:
     else:
         target = url if url else f"ytsearch1:{query} song official audio"
 
+    captured_errors = []
+
+    class SingleLogger:
+        def debug(self, msg):   pass
+        def info(self, msg):    pass
+        def warning(self, msg): pass
+        def error(self, msg):   captured_errors.append(msg)
+
     try:
-        with yt_dlp.YoutubeDL(_build_ydl_opts()) as ydl:
+        ydl_opts = _build_ydl_opts(ignore_errors=False, logger=SingleLogger())
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(target, download=True)
             if not info:
-                log_failed_download(query, "No search results found")
+                err_joined = " ".join(captured_errors)
+                if _is_yt_blocked(err_joined):
+                    log_failed_download(query, "YouTube blocked server IP")
+                    write_dl_log({"type": "single", "title": query, "artist": "?", "lyrics": "—", "status": "FAILED: YouTube blocked server IP"})
+                    return {"success": False, "error": "YT_BLOCKED"}
+                log_failed_download(query, err_joined or "No search results found")
                 return {"success": False, "error": "NO_RESULTS"}
 
             # Handle entries list — skip any None entries
@@ -662,7 +678,12 @@ def run_single_download(query: str) -> dict:
                 entry = info
 
             if entry is None:
-                log_failed_download(query, "No search results found")
+                err_joined = " ".join(captured_errors)
+                if _is_yt_blocked(err_joined):
+                    log_failed_download(query, "YouTube blocked server IP")
+                    write_dl_log({"type": "single", "title": query, "artist": "?", "lyrics": "—", "status": "FAILED: YouTube blocked server IP"})
+                    return {"success": False, "error": "YT_BLOCKED"}
+                log_failed_download(query, err_joined or "No search results found")
                 return {"success": False, "error": "NO_RESULTS"}
 
             track = process_single_entry(ydl, entry)
@@ -680,7 +701,7 @@ def run_single_download(query: str) -> dict:
 
     except Exception as e:
         err_str = str(e)
-        if _is_yt_blocked(err_str):
+        if _is_yt_blocked(err_str) or any(_is_yt_blocked(err) for err in captured_errors):
             log_failed_download(query, "YouTube blocked server IP")
             write_dl_log({"type": "single", "title": query, "artist": "?", "lyrics": "—", "status": "FAILED: YouTube blocked server IP"})
             return {"success": False, "error": "YT_BLOCKED"}
