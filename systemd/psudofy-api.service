@@ -1,0 +1,15 @@
+[Unit]
+Description=PSudofy Headless YouTube Share Receiver API
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/PSudofy
+ExecStart=/home/ubuntu/PSudofy/venv/bin/python web_downloader.py
+Restart=always
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target

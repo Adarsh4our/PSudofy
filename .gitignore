@@ -1,5 +1,24 @@
-# ─── Music & Downloads ────────────────────────────────────────────────────────
-# Downloaded music files (can be huge)
+# ─── Secrets & Credentials ───────────────────────────────────────────────────
+.env
+.env.*
+!.env.example
+*.secret
+secrets.txt
+cookies.txt
+*.key
+*.pem
+id_rsa*
+server_info.md
+
+# ─── Dynamic Data & Databases ─────────────────────────────────────────────────
+data/
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+
+# ─── Music & Audio Files ──────────────────────────────────────────────────────
 music/
 *.mp3
 *.flac
@@ -7,43 +26,41 @@ music/
 *.opus
 *.ogg
 *.wav
+*.aac
 
-# ─── Download Archives ────────────────────────────────────────────────────────
-# Download archives (tracks what's been downloaded)
+# ─── Download Archives & Logs ─────────────────────────────────────────────────
 downloaded_spotify.txt
 downloaded_yt.txt
-
-# ─── Navidrome Data ───────────────────────────────────────────────────────────
-# Navidrome database, cache, and config
-data/
-backups/*.zip
-
-# ─── Application Logs ─────────────────────────────────────────────────────────
+download_log.json
+failed_downloads.json
+missing_lyrics.json
+lastfm_cache.json
+song_list.txt
 logs/
+*.log
 
-# ─── Python ───────────────────────────────────────────────────────────────────
+# ─── Backups ──────────────────────────────────────────────────────────────────
+backups/
+*.zip
+*.tar.gz
+*.bak
+
+# ─── Python & Virtual Environments ────────────────────────────────────────────
 __pycache__/
 *.py[cod]
-*.pyo
-*.pyd
-.Python
+*$py.class
 *.egg-info/
+.eggs/
 dist/
 build/
-.eggs/
-.venv/
 venv/
+.venv/
 env/
-*.egg
+.Python
 
-# ─── Environment / Secrets ────────────────────────────────────────────────────
-.env
-.env.*
-!.env.example
-*.secret
-secrets.txt
-
-# ─── OS Clutter ───────────────────────────────────────────────────────────────
+# ─── IDE & OS Clutter ─────────────────────────────────────────────────────────
+.vscode/
+.idea/
 .DS_Store
 Thumbs.db
 desktop.ini

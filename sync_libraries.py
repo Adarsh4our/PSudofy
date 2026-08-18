@@ -13,8 +13,8 @@ from dotenv import load_dotenv
 project_dir = Path(r"C:\Users\Adarsh Singh\PSudofy")
 load_dotenv(project_dir / ".env")
 
-SSH_KEY_PATH = os.getenv("SSH_KEY_PATH", r"C:\Users\Adarsh Singh\Downloads\imp\ssh-key-2026-05-28.key")
-SSH_HOST = os.getenv("SSH_HOST", "ubuntu@161.118.165.241")
+SSH_KEY_PATH = os.getenv("SSH_KEY_PATH", r"C:\Users\Adarsh Singh\Desktop\ssh-key-2026-07-28.key")
+SSH_HOST = os.getenv("SSH_HOST", "ubuntu@168.138.114.54")
 REMOTE_DIR = os.getenv("REMOTE_DIR", "~/PSudofy")
 MUSIC_FOLDER = os.getenv("MUSIC_FOLDER", "./music")
 
