@@ -43,7 +43,7 @@ from rich.prompt import Confirm, Prompt
 console = Console(force_terminal=True)
 
 LISTENBRAINZ_USER = os.getenv("LISTENBRAINZ_USER", "")
-GENIUS_TOKEN = os.getenv("GENIUS_TOKEN", "n5vYx1OeQlrFrtX9t3zFGzYs5mNVKJRSnUv4Y3R4VTIMSd2yh-D9xk0xZxF6e536")
+GENIUS_TOKEN = os.getenv("GENIUS_TOKEN", "")
 MUSIC_FOLDER = os.getenv("MUSIC_FOLDER", "./music")
 API_BASE = "https://api.listenbrainz.org/1"
 FFMPEG_PATH = os.path.join(SPOTDL_FFMPEG_DIR, "ffmpeg.exe")
@@ -404,12 +404,23 @@ def main():
 
         console.print(f"\n[bold green]✨ Finished downloading {success}/{len(new_recs)} NEW songs + lyrics to your library![/bold green]")
 
-        # Trigger Navidrome scan
+        # Trigger Navidrome scan using Subsonic API (self-contained, no external module needed)
         try:
-            from downloader import trigger_navidrome_scan
-            trigger_navidrome_scan()
-        except Exception:
-            pass
+            import hashlib, secrets as _secrets
+            _navi_url  = os.getenv("NAVIDROME_URL", "http://localhost:4533")
+            _navi_user = os.getenv("NAVI_USER", "adarsh4our")
+            _navi_pass = os.getenv("NAVI_PASS", "")
+            _salt  = _secrets.token_hex(8)
+            _token = hashlib.md5((_navi_pass + _salt).encode()).hexdigest()
+            _params = urllib.parse.urlencode({
+                "u": _navi_user, "t": _token, "s": _salt,
+                "v": "1.16.1", "c": "fetch-recs", "f": "json"
+            })
+            urllib.request.urlopen(f"{_navi_url}/rest/startScan.view?{_params}", timeout=5)
+            console.print("[dim cyan]Navidrome scan triggered.[/dim cyan]")
+        except Exception as _e:
+            console.print(f"[dim yellow]Navidrome scan skipped: {_e}[/dim yellow]")
+
     else:
         console.print("[dim cyan]No downloads performed.[/dim cyan]")
 

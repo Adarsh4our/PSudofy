@@ -30,8 +30,14 @@ app = Flask(__name__)
 MUSIC_FOLDER = os.path.expanduser("~/PSudofy/music")
 ARCHIVE_FILE = os.path.expanduser("~/PSudofy/downloaded_yt.txt")
 NAVIDROME_URL = os.getenv("NAVIDROME_URL", "http://localhost:4533")
-NAVI_USER = os.getenv("NAVI_USER", "adarsh4our")
-NAVI_PASS = os.getenv("NAVI_PASS", "adarsh_@1234")
+NAVI_USER = os.getenv("NAVI_USER", "")
+NAVI_PASS = os.getenv("NAVI_PASS", "")
+# Optional token auth for the web API endpoints.
+# Set WEB_DL_TOKEN in .env to require callers to pass X-Token header or ?token= param.
+# Leave empty to disable auth (legacy / local-only setups).
+API_TOKEN = os.getenv("WEB_DL_TOKEN", "")
+COOLDOWN_SECONDS = int(os.getenv("WEB_DL_COOLDOWN_SECONDS", "5"))
+_client_cooldowns = {}
 
 # Mutagen for lyrics
 try:
@@ -61,6 +67,19 @@ def trigger_navidrome_scan():
         return True
     except Exception:
         return False
+
+
+def _check_auth() -> bool:
+    """Return True if request is authorized. If API_TOKEN is empty, all requests pass."""
+    if not API_TOKEN:
+        return True
+    provided = (
+        request.headers.get("X-Token")
+        or request.args.get("token")
+        or (request.get_json(silent=True) or {}).get("token")
+        or request.form.get("token")
+    )
+    return provided == API_TOKEN
 
 
 def clean_lyric_title(title: str) -> str:
@@ -198,8 +217,24 @@ def process_download(query_or_url: str):
         }
 
 
+def _is_rate_limited(ip: str) -> bool:
+    now = time.time()
+    last_req = _client_cooldowns.get(ip, 0)
+    if now - last_req < COOLDOWN_SECONDS:
+        return True
+    _client_cooldowns[ip] = now
+    return False
+
+
 @app.route("/api/download", methods=["GET", "POST"])
 def api_download():
+    if not _check_auth():
+        return jsonify({"status": "error", "message": "Unauthorized — provide a valid X-Token header or ?token= param"}), 403
+
+    client_ip = request.remote_addr or "127.0.0.1"
+    if _is_rate_limited(client_ip):
+        return jsonify({"status": "error", "message": f"Too many requests — please wait {COOLDOWN_SECONDS}s between downloads"}), 429
+
     query = ""
     data = request.get_json(silent=True) or {}
     if isinstance(data, dict):
@@ -242,6 +277,8 @@ def api_download():
 
 @app.route("/api/scan", methods=["GET", "POST"])
 def api_scan():
+    if not _check_auth():
+        return jsonify({"status": "error", "message": "Unauthorized"}), 403
     ok = trigger_navidrome_scan()
     return jsonify({"status": "ok" if ok else "error"})
 
@@ -253,6 +290,8 @@ def api_health():
 
 @app.route("/shortcut.json", methods=["GET"])
 def get_shortcut():
+    external_base = os.getenv("EXTERNAL_SERVER_URL") or request.host_url.rstrip("/")
+    download_url = f"{external_base}/api/download"
     return jsonify({
         "version": 4,
         "categories": [
@@ -264,7 +303,7 @@ def get_shortcut():
                         "id": 1,
                         "name": "PSudofy Download",
                         "description": "Download shared song to PSudofy library",
-                        "url": "http://168.138.114.54:5001/api/download",
+                        "url": download_url,
                         "method": "POST",
                         "bodyType": "custom_text",
                         "bodyContent": "{\"query\": \"{{text}}\"}",

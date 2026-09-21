@@ -36,6 +36,20 @@ failed_downloads.json
 missing_lyrics.json
 lastfm_cache.json
 song_list.txt
+lyrics_*.txt
+newly_available_synced.txt
+*_tracks.json
+*_report.json
+*_duplicates.json
+*_plan.json
+*_duplicates*.md
+check_*.py
+test_*.py
+download_sanam_*.py
+fix_sanam_*.py
+extract_and_finalize.py
+run_full_backup_d.py
+fix_ext_server.sh
 logs/
 *.log
 

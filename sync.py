@@ -262,7 +262,7 @@ def download_songs_locally_and_upload(url: str, dry_run: bool = False) -> dict:
     # ── Build download command ────────────────────────────────────────────────
     if is_spotify:
         archive_file    = os.path.join(os.path.dirname(os.path.abspath(__file__)), "downloaded_spotify.txt")
-        output_template = os.path.join(LOCAL_MUSIC_FOLDER, "{artist}", "{title} - {artist}.{ext}")
+        output_template = os.path.join(LOCAL_MUSIC_FOLDER, "{artist}", "{title} - {artist}.{output-ext}")
         cmd = [
             "spotdl", "download", url,
             "--output", output_template,

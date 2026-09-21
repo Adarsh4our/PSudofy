@@ -75,6 +75,7 @@
 PSudofy/
 ├── discord_bot.py           # 24/7 Discord bot (Core download engine & library manager)
 ├── web_downloader.py        # Headless API receiver for Android HTTP Shortcuts
+├── wrapped_generator.py     # Spotify-Wrapped style cards & audio personality engine
 ├── docker-compose.yml       # Navidrome streaming server configuration
 ├── requirements.txt         # Python dependencies
 ├── .env.example             # Configuration template
@@ -82,8 +83,11 @@ PSudofy/
 ├── systemd/                 # Linux service definitions
 │   ├── psudofy-discord.service
 │   └── psudofy-api.service
+├── scripts/
+│   └── fix_ext_filenames.py # Audits & cleans up legacy .{ext}.mp3 files + DB updater
+├── backup_library.py        # Automated library & database backup manager
 ├── clean_titles.py          # ID3 metadata title sanitizer
-├── smart_playlists.py       # Smart playlist generator
+├── smart_playlists.py       # Smart playlist generator (Last.fm + ListenBrainz)
 ├── remove_duplicates.py     # Audio library duplicate cleaner
 ├── sync.py                  # CLI sync and remote uploader
 ├── sync_libraries.py        # Library synchronization tool
@@ -162,6 +166,29 @@ sudo systemctl enable --now psudofy-discord
 
 ---
 
+## 🛠️ Maintenance & Utilities
+
+- **Backup Library & Database**:
+  ```bash
+  python backup_library.py
+  ```
+  Archives the SQLite database and music index to prevent data loss.
+
+- **Sanitize Legacy `.{ext}.mp3` Filenames**:
+  ```bash
+  # Preview files that will be renamed:
+  python scripts/fix_ext_filenames.py --dry-run
+
+  # Apply safe file renames and update SQLite database paths:
+  python scripts/fix_ext_filenames.py --apply
+
+  # Generate an executable bash script for your Linux cloud server:
+  python scripts/fix_ext_filenames.py --server-script
+  ```
+
+---
+
 ## 🛡️ License
 
 This project is open-source under the [MIT License](LICENSE).
+
