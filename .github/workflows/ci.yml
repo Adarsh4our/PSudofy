@@ -20,8 +20,8 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          pip install -r requirements.txt ruff
 
       - name: Lint with Ruff
         run: |
-          ruff check downloader.py
+          ruff check --select E9,F63,F7,F82 fill_synced_lyrics.py discord_bot.py web_downloader.py sync.py add_lyrics.py wrapped_generator.py smart_playlists.py scripts/

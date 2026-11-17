@@ -13,29 +13,37 @@ import sys
 import time
 import json
 import re
+import hmac
 import urllib.request
 import urllib.parse
+import ssl
 import hashlib
 import secrets
 import subprocess
 from datetime import datetime
+from pathlib import Path
+
+_SSL_CTX = ssl._create_unverified_context()
 
 from flask import Flask, request, jsonify
 from dotenv import load_dotenv
 
+PROJECT_ROOT = Path(__file__).resolve().parent
+load_dotenv(PROJECT_ROOT / ".env")
 load_dotenv(os.path.expanduser("~/PSudofy/.env"))
 
 app = Flask(__name__)
 
-MUSIC_FOLDER = os.path.expanduser("~/PSudofy/music")
-ARCHIVE_FILE = os.path.expanduser("~/PSudofy/downloaded_yt.txt")
+MUSIC_FOLDER = os.path.expanduser(os.getenv("MUSIC_FOLDER", str(PROJECT_ROOT / "music")))
+ARCHIVE_FILE = os.path.expanduser(os.getenv("ARCHIVE_FILE", str(PROJECT_ROOT / "downloaded_yt.txt")))
 NAVIDROME_URL = os.getenv("NAVIDROME_URL", "http://localhost:4533")
 NAVI_USER = os.getenv("NAVI_USER", "")
 NAVI_PASS = os.getenv("NAVI_PASS", "")
 # Optional token auth for the web API endpoints.
-# Set WEB_DL_TOKEN in .env to require callers to pass X-Token header or ?token= param.
-# Leave empty to disable auth (legacy / local-only setups).
+# Set WEB_DL_TOKEN in .env to require callers to pass X-Token header.
+# Set WEB_DL_ALLOW_UNAUTHENTICATED=1 to explicitly allow local-only unauthenticated use.
 API_TOKEN = os.getenv("WEB_DL_TOKEN", "")
+ALLOW_UNAUTH = os.getenv("WEB_DL_ALLOW_UNAUTHENTICATED", "").lower() in ("1", "true", "yes")
 COOLDOWN_SECONDS = int(os.getenv("WEB_DL_COOLDOWN_SECONDS", "5"))
 _client_cooldowns = {}
 
@@ -63,23 +71,27 @@ def _subsonic_token_params() -> dict:
 def trigger_navidrome_scan():
     try:
         params = urllib.parse.urlencode(_subsonic_token_params())
-        urllib.request.urlopen(f"{NAVIDROME_URL}/rest/startScan.view?{params}", timeout=5)
+        urllib.request.urlopen(
+            f"{NAVIDROME_URL}/rest/startScan.view?{params}",
+            timeout=5,
+            context=_SSL_CTX if NAVIDROME_URL.startswith("https") else None,
+        )
         return True
     except Exception:
         return False
 
 
 def _check_auth() -> bool:
-    """Return True if request is authorized. If API_TOKEN is empty, all requests pass."""
+    """Return True if request is authorized. Requires WEB_DL_TOKEN unless WEB_DL_ALLOW_UNAUTHENTICATED=1."""
     if not API_TOKEN:
-        return True
+        return ALLOW_UNAUTH
     provided = (
         request.headers.get("X-Token")
-        or request.args.get("token")
         or (request.get_json(silent=True) or {}).get("token")
         or request.form.get("token")
+        or ""
     )
-    return provided == API_TOKEN
+    return hmac.compare_digest(str(provided), str(API_TOKEN))
 
 
 def clean_lyric_title(title: str) -> str:
@@ -92,7 +104,12 @@ def clean_lyric_title(title: str) -> str:
     return t.strip()
 
 
-def fetch_lyrics_lrclib(title: str, artist: str) -> tuple:
+def fetch_lyrics_lrclib(title: str, artist: str, mp3_path: str = "") -> tuple:
+    try:
+        from fill_synced_lyrics import find_best_lyrics
+        return find_best_lyrics(title, artist, mp3_path=mp3_path)
+    except Exception:
+        pass
     try:
         params = urllib.parse.urlencode({
             "track_name": clean_lyric_title(title),
@@ -111,15 +128,15 @@ def fetch_lyrics_lrclib(title: str, artist: str) -> tuple:
 
 def parse_lrc(lrc: str):
     result = []
-    pattern = re.compile(r"\[(\d+):(\d+)(?:\.(\d+))?\](.*)")
+    pattern = re.compile(r"\[(\d+):(\d+)(?:[.:](\d+))?\](.*)")
     for line in lrc.splitlines():
         m = pattern.match(line.strip())
         if m:
             mins = int(m.group(1))
             secs = int(m.group(2))
-            centis = int(m.group(3) or 0)
+            frac = (m.group(3) or "0")[:3].ljust(3, "0")
             text = m.group(4).strip()
-            ms = (mins * 60 + secs) * 1000 + centis * 10
+            ms = (mins * 60 + secs) * 1000 + int(frac)
             if text:
                 result.append((text, ms))
     return result
@@ -134,15 +151,22 @@ def embed_lyrics(mp3_path: str, plain: str, synced: str) -> bool:
         except ID3NoHeaderError:
             tags = ID3()
 
-        if plain:
+        uslt_text = synced or plain
+        if uslt_text:
             tags.delall("USLT")
-            tags.add(USLT(encoding=Encoding.UTF8, lang="eng", desc="", text=plain))
+            tags.add(USLT(encoding=Encoding.UTF8, lang="eng", desc="", text=uslt_text))
         if synced:
             parsed = parse_lrc(synced)
             if parsed:
                 tags.delall("SYLT")
                 tags.add(SYLT(encoding=Encoding.UTF8, lang="eng", format=2, type=1, desc="", text=parsed))
-        tags.save(mp3_path)
+            try:
+                lrc_path = os.path.splitext(mp3_path)[0] + ".lrc"
+                with open(lrc_path, "w", encoding="utf-8") as lrc_f:
+                    lrc_f.write(synced)
+            except Exception:
+                pass
+        tags.save(mp3_path, v2_version=3)
         return True
     except Exception:
         return False
@@ -195,7 +219,7 @@ def process_download(query_or_url: str):
             mp3_path = os.path.splitext(filename)[0] + ".mp3"
 
             if os.path.exists(mp3_path):
-                plain, synced = fetch_lyrics_lrclib(title, artist)
+                plain, synced = fetch_lyrics_lrclib(title, artist, mp3_path)
                 if plain or synced:
                     embed_lyrics(mp3_path, plain, synced)
 

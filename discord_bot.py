@@ -16,10 +16,13 @@ import subprocess
 import threading
 import urllib.request
 import urllib.parse
+import ssl
 import hashlib
 import secrets
 import sqlite3
 import datetime
+
+_SSL_CTX = ssl._create_unverified_context()
 
 import discord
 from discord.ext import commands, tasks
@@ -27,22 +30,34 @@ from dotenv import load_dotenv
 import shutil
 
 from wrapped_generator import get_wrapped_data, generate_wrapped_card
+from pathlib import Path
+import traceback
 
+PROJECT_ROOT = Path(__file__).resolve().parent
+load_dotenv(PROJECT_ROOT / ".env")
 load_dotenv(os.path.expanduser("~/PSudofy/.env"))
 
 DISCORD_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
-MUSIC_FOLDER  = os.path.expanduser("~/PSudofy/music")
-DB_PATH       = os.path.expanduser("~/PSudofy/data/navidrome.db")
+MUSIC_FOLDER  = os.path.expanduser(os.getenv("MUSIC_FOLDER", str(PROJECT_ROOT / "music")))
+DB_PATH       = os.path.expanduser(os.getenv("DB_PATH", str(PROJECT_ROOT / "data" / "navidrome.db")))
 NAVIDROME_URL = os.getenv("NAVIDROME_URL", "http://localhost:4533")
 NAVI_USER     = os.getenv("NAVI_USER",    "")
 NAVI_PASS     = os.getenv("NAVI_PASS",    "")
-ARCHIVE_FILE  = os.path.expanduser("~/PSudofy/downloaded_yt.txt")
-SPOTDL_BIN    = os.path.expanduser("~/PSudofy/venv/bin/spotdl")
-COOKIES_PATH  = os.path.expanduser("~/PSudofy/cookies.txt")
-DL_LOG_FILE   = os.path.expanduser("~/PSudofy/download_log.json")
+ARCHIVE_FILE  = os.path.expanduser(os.getenv("ARCHIVE_FILE", str(PROJECT_ROOT / "downloaded_yt.txt")))
+SPOTDL_BIN    = os.path.expanduser(os.getenv("SPOTDL_BIN", str(PROJECT_ROOT / "venv" / "bin" / "spotdl")))
+COOKIES_PATH  = os.path.expanduser(os.getenv("COOKIES_PATH", str(PROJECT_ROOT / "cookies.txt")))
+DL_LOG_FILE   = os.path.expanduser(os.getenv("DL_LOG_FILE", str(PROJECT_ROOT / "download_log.json")))
+
+ALLOWED_USER_IDS: set[int] = {
+    int(x.strip()) for x in os.getenv("DISCORD_OWNER_IDS", "").split(",") if x.strip().isdigit()
+}
+ALLOWED_CHANNEL_IDS: set[int] = {
+    int(x.strip()) for x in os.getenv("ALLOWED_CHANNEL_IDS", "").split(",") if x.strip().isdigit()
+}
 
 ACTIVE_SUBPROCESSES = []
 ACTIVE_TASKS = set()
+CANCEL_EVENT = threading.Event()
 _json_lock = threading.Lock()          # protects all JSON log file I/O
 _download_lock: asyncio.Lock | None = None  # initialized on first use; protects concurrent playlist downloads
 MAX_CONCURRENT_DOWNLOADS = int(os.getenv("MAX_CONCURRENT_DOWNLOADS", "2"))
@@ -52,8 +67,9 @@ WEEKLY_CHANNEL_ID: int | None = int(os.getenv("WEEKLY_CHANNEL_ID", "0")) or None
 
 
 def kill_all_download_processes():
-    """Kill any running spotdl, yt-dlp, or ffmpeg processes."""
+    """Signal active download threads to stop and terminate tracked subprocesses."""
     global ACTIVE_SUBPROCESSES
+    CANCEL_EVENT.set()
     for p in list(ACTIVE_SUBPROCESSES):
         try:
             p.terminate()
@@ -61,13 +77,6 @@ def kill_all_download_processes():
         except Exception:
             pass
     ACTIVE_SUBPROCESSES.clear()
-
-    # Also system kill any lingering background workers
-    for name in ["spotdl", "yt-dlp", "ffmpeg"]:
-        try:
-            subprocess.run(["pkill", "-9", "-f", name], capture_output=True)
-        except Exception:
-            pass
 
 
 
@@ -121,64 +130,43 @@ def run_spotify_playlist_download(url: str, progress_cb=None, create_playlist: b
     if progress_cb:
         progress_cb(0, total_count, f"Found {total_count} songs in \"{playlist_title}\"")
 
-    # Connect to Navidrome DB to check existing tracks
+    # Check local Navidrome library for existing tracks (artist + title aware)
     matched_ids = []
     downloaded_tracks = []
     missing_to_download = []
 
-    try:
-        conn = sqlite3.connect(DB_PATH)
-        try:
-            cur = conn.cursor()
-
-            for idx, t in enumerate(tracks, 1):
-                title = t["title"]
-                artist = t["artist"]
-                clean_t = clean_title_for_lyrics(title)
-
-                # Check DB for song by title or path
-                row = cur.execute("""
-                    SELECT id, title, artist FROM media_file 
-                    WHERE missing = 0 AND (
-                        lower(title) LIKE lower(?) OR 
-                        lower(title) LIKE lower(?) OR
-                        lower(path) LIKE lower(?)
-                    )
-                    LIMIT 1
-                """, (f"%{clean_t}%", f"{clean_t}%", f"%{clean_t}%")).fetchone()
-
-                if row:
-                    matched_ids.append(row[0])
-                    downloaded_tracks.append({
-                        "title": row[1] or title,
-                        "artist": row[2] or artist,
-                        "lyrics": "✅ In library",
-                        "navidrome_id": row[0]
-                    })
-                    if progress_cb:
-                        progress_cb(idx, total_count, f"Matched: {title}")
-                else:
-                    missing_to_download.append(t)
-        finally:
-            conn.close()
-
-    except Exception as e:
-        print(f"[Navidrome DB match error] {e}", flush=True)
+    for idx, t in enumerate(tracks, 1):
+        title = t["title"]
+        artist = t["artist"]
+        sid = navidrome_search_track(title, artist)
+        if sid:
+            matched_ids.append(sid)
+            downloaded_tracks.append({
+                "title": title,
+                "artist": artist,
+                "lyrics": "✅ In library",
+                "navidrome_id": sid
+            })
+            if progress_cb:
+                progress_cb(idx, total_count, f"Matched: {title}")
+        else:
+            missing_to_download.append(t)
 
     # Download any missing tracks
     failed_count = 0
     if missing_to_download:
         for idx, t in enumerate(missing_to_download, len(downloaded_tracks) + 1):
+            if CANCEL_EVENT.is_set():
+                break
             query = f"{t['title']} {t['artist']}"
             if progress_cb:
                 progress_cb(idx, total_count, f"Downloading missing: {t['title']}")
-            res = run_single_download(query)
+            res = run_single_download(query, trigger_scan=False)
             if res.get("success"):
                 downloaded_tracks.append(res)
             else:
                 failed_count += 1
 
-        trigger_navidrome_scan()
         navidrome_wait_scan(timeout=90)
 
         # Match newly downloaded tracks in Navidrome AFTER scan completes
@@ -242,24 +230,27 @@ def _subsonic_params() -> dict:
 
 
 def trigger_navidrome_scan(full: bool = False) -> bool:
-    """Trigger an instant rescan in Navidrome via docker CLI or Subsonic API."""
-    try:
-        cmd = ["docker", "exec", "psudofy_navidrome_1", "/app/navidrome", "scan"]
-        if full:
-            cmd.append("--full")
-        res = subprocess.run(cmd, capture_output=True, text=True, timeout=45)
-        if res.returncode == 0:
-            return True
-    except Exception as e:
-        print(f"[Navidrome Docker Scan Error] {e}", flush=True)
+    """Trigger an instant rescan in Navidrome via Subsonic API or docker CLI."""
+    if NAVI_USER and NAVI_PASS:
+        try:
+            params = urllib.parse.urlencode(_subsonic_params())
+            with urllib.request.urlopen(f"{NAVIDROME_URL}/rest/startScan.view?{params}", timeout=5, context=_SSL_CTX if NAVIDROME_URL.startswith("https") else None) as resp:
+                if resp.status == 200:
+                    return True
+        except Exception:
+            pass
 
-    # Fallback to subsonic endpoint
-    try:
-        params = urllib.parse.urlencode(_subsonic_params())
-        with urllib.request.urlopen(f"{NAVIDROME_URL}/rest/startScan.view?{params}", timeout=5) as resp:
-            return True
-    except Exception:
-        return False
+    for container in ("psudofy-navidrome", "psudofy-navidrome-1", "psudofy_navidrome_1"):
+        try:
+            cmd = ["docker", "exec", container, "/app/navidrome", "scan"]
+            if full:
+                cmd.append("--full")
+            res = subprocess.run(cmd, capture_output=True, text=True, timeout=45)
+            if res.returncode == 0:
+                return True
+        except Exception:
+            continue
+    return False
 
 
 def navidrome_wait_scan(timeout: int = 30):
@@ -271,7 +262,7 @@ def navidrome_wait_scan(timeout: int = 30):
         try:
             params = urllib.parse.urlencode({**_subsonic_params(), "f": "json"})
             with urllib.request.urlopen(
-                f"{NAVIDROME_URL}/rest/getScanStatus.view?{params}", timeout=4
+                f"{NAVIDROME_URL}/rest/getScanStatus.view?{params}", timeout=4, context=_SSL_CTX if NAVIDROME_URL.startswith("https") else None
             ) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
                 status = data.get("subsonic-response", {}).get("scanStatus", {})
@@ -298,6 +289,11 @@ def get_artist_tokens(artist: str) -> set[str]:
     return tokens
 
 
+def _escape_like(val: str) -> str:
+    """Escape SQLite LIKE wildcard characters."""
+    return val.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
 def navidrome_search_track(title: str, artist: str, album_artist: str | None = None) -> str | None:
     """Search Navidrome SQLite DB directly for a track. Requires both title AND artist matching (so cover versions aren't mixed up)."""
     clean_t = clean_title_for_lyrics(title)
@@ -310,19 +306,28 @@ def navidrome_search_track(title: str, artist: str, album_artist: str | None = N
     if not clean_t:
         return None
 
+    esc_t = _escape_like(clean_t)
     try:
         conn = sqlite3.connect(DB_PATH)
         try:
             cur = conn.cursor()
             rows = cur.execute("""
                 SELECT id, title, artist, path FROM media_file
-                WHERE missing = 0 AND (lower(title) LIKE lower(?) OR lower(path) LIKE lower(?))
-            """, (f"%{clean_t}%", f"%{clean_t}%")).fetchall()
+                WHERE missing = 0 AND (
+                    lower(title) LIKE lower(?) ESCAPE '\\' OR
+                    lower(path) LIKE lower(?) ESCAPE '\\'
+                )
+            """, (f"%{esc_t}%", f"%{esc_t}%")).fetchall()
 
             in_tokens = get_artist_tokens(clean_a) if clean_a and clean_a.lower() not in generic_channels else set()
 
             for r in rows:
                 mid, db_title, db_artist, db_path = r
+                db_clean_t = clean_title_for_lyrics(db_title or "")
+                # Avoid substring false positives like "Heer" matching "Heeriye"
+                if len(clean_t) <= 5 and db_clean_t.lower() != clean_t.lower():
+                    continue
+
                 db_tokens = get_artist_tokens(db_artist or "")
 
                 # If artist is known, require matching artist tokens or sub-string match
@@ -333,7 +338,7 @@ def navidrome_search_track(title: str, artist: str, album_artist: str | None = N
                         return mid
                 elif not in_tokens:
                     # If artist is completely unknown, only match if clean title is exact
-                    if clean_t.lower() == (db_title or "").lower():
+                    if clean_t.lower() == db_clean_t.lower():
                         return mid
         finally:
             conn.close()
@@ -360,29 +365,83 @@ def _get_owner_id() -> str:
 
 
 def navidrome_create_playlist(name: str, song_ids: list[str]) -> bool:
-    """Create (or replace) a Navidrome playlist by name directly in the database."""
+    """Create (or replace) a Navidrome playlist by name via Subsonic API or SQLite fallback."""
     if not song_ids:
         return False
     # Deduplicate while preserving order
     song_ids = list(dict.fromkeys(song_ids))
+
+    # 1. Prefer official Subsonic API so Navidrome manages its own schema & counters
+    if NAVI_USER and NAVI_PASS:
+        try:
+            base_params = _subsonic_params()
+            ctx_ssl = _SSL_CTX if NAVIDROME_URL.startswith("https") else None
+            with urllib.request.urlopen(
+                f"{NAVIDROME_URL}/rest/getPlaylists.view?{urllib.parse.urlencode(base_params)}",
+                timeout=6,
+                context=ctx_ssl,
+            ) as resp:
+                pl_data = json.loads(resp.read().decode("utf-8"))
+            existing_list = (
+                pl_data.get("subsonic-response", {})
+                .get("playlists", {})
+                .get("playlist", [])
+            )
+            existing_id = next((p.get("id") for p in existing_list if p.get("name") == name), None)
+
+            query_pairs = list(_subsonic_params().items())
+            if existing_id:
+                query_pairs.append(("playlistId", existing_id))
+            else:
+                query_pairs.append(("name", name))
+            for sid in song_ids:
+                query_pairs.append(("songId", sid))
+
+            qs = urllib.parse.urlencode(query_pairs)
+            req = urllib.request.Request(
+                f"{NAVIDROME_URL}/rest/createPlaylist.view",
+                data=qs.encode("utf-8"),
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=10, context=ctx_ssl) as resp:
+                res_json = json.loads(resp.read().decode("utf-8"))
+                if res_json.get("subsonic-response", {}).get("status") == "ok":
+                    return True
+        except Exception as e:
+            print(f"[Playlist Subsonic API fallback to DB] {e}", flush=True)
+
+    # 2. Fallback: direct SQLite write (keeping song_count & duration accurate)
     try:
         import uuid
         now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         conn = sqlite3.connect(DB_PATH)
         try:
             conn.execute("PRAGMA journal_mode=WAL")
+            owner_id = _get_owner_id()
 
-            existing = conn.execute("SELECT id FROM playlist WHERE name = ? AND owner_id = ?", (name, _get_owner_id())).fetchone()
+            placeholders = ",".join("?" for _ in song_ids)
+            stats_row = conn.execute(
+                f"SELECT COUNT(*), COALESCE(SUM(duration), 0), COALESCE(SUM(size), 0) FROM media_file WHERE id IN ({placeholders})",
+                tuple(song_ids),
+            ).fetchone()
+            song_count = stats_row[0] if stats_row else len(song_ids)
+            total_dur = stats_row[1] if stats_row else 0
+
+            existing = conn.execute("SELECT id FROM playlist WHERE name = ? AND owner_id = ?", (name, owner_id)).fetchone()
             if existing:
                 pl_id = existing[0]
                 conn.execute("DELETE FROM playlist_tracks WHERE playlist_id = ?", (pl_id,))
-                conn.execute("UPDATE playlist SET updated_at = ?, comment = ? WHERE id = ?", (now, "Imported by PSudofy Discord Bot", pl_id))
+                conn.execute(
+                    "UPDATE playlist SET updated_at = ?, comment = ?, song_count = ?, duration = ? WHERE id = ?",
+                    (now, "Imported by PSudofy Discord Bot", song_count, total_dur, pl_id),
+                )
             else:
                 pl_id = uuid.uuid4().hex[:20]
                 conn.execute("""
-                    INSERT INTO playlist (id, name, comment, public, path, sync, owner_id, created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, (pl_id, name, "Imported by PSudofy Discord Bot", 0, "", 0, _get_owner_id(), now, now))
+                    INSERT INTO playlist (id, name, comment, public, path, sync, owner_id, created_at, updated_at, song_count, duration)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (pl_id, name, "Imported by PSudofy Discord Bot", 0, "", 0, owner_id, now, now, song_count, total_dur))
 
             for pos, sid in enumerate(song_ids, 1):
                 conn.execute("INSERT OR IGNORE INTO playlist_tracks (id, playlist_id, media_file_id) VALUES (?, ?, ?)", (pos, pl_id, sid))
@@ -396,8 +455,8 @@ def navidrome_create_playlist(name: str, song_ids: list[str]) -> bool:
         return False
 
 
-FAILED_DOWNLOADS_FILE = os.path.expanduser("~/PSudofy/failed_downloads.json")
-MISSING_LYRICS_FILE   = os.path.expanduser("~/PSudofy/missing_lyrics.json")
+FAILED_DOWNLOADS_FILE = os.path.expanduser(os.getenv("FAILED_DOWNLOADS_FILE", str(PROJECT_ROOT / "failed_downloads.json")))
+MISSING_LYRICS_FILE   = os.path.expanduser(os.getenv("MISSING_LYRICS_FILE", str(PROJECT_ROOT / "missing_lyrics.json")))
 
 
 def log_failed_download(query: str, reason: str):
@@ -572,15 +631,19 @@ def clean_artist_for_lyrics(artist: str) -> str:
     return re.split(r"[,/&]|\bfeat\b|\bft\b", artist, flags=re.IGNORECASE)[0].strip()
 
 
-def fetch_lyrics(title: str, artist: str) -> tuple[str | None, str | None]:
-    """Fetch lyrics from lrclib.net. Returns (plain, synced)."""
+def fetch_lyrics(title: str, artist: str, mp3_path: str = "") -> tuple[str | None, str | None]:
+    """Fetch synced (preferred) or plain lyrics via shared smart matcher."""
+    try:
+        from fill_synced_lyrics import find_best_lyrics
+        return find_best_lyrics(title, artist, mp3_path=mp3_path)
+    except Exception:
+        pass
+
     clean_t = clean_title_for_lyrics(title)
     clean_a = clean_artist_for_lyrics(artist)
-
-    # Try with artist
     for params_dict in [
         {"track_name": clean_t, "artist_name": clean_a},
-        {"track_name": clean_t},                        # fallback: title only
+        {"track_name": clean_t},
     ]:
         try:
             url = f"https://lrclib.net/api/get?{urllib.parse.urlencode(params_dict)}"
@@ -598,9 +661,10 @@ def fetch_lyrics(title: str, artist: str) -> tuple[str | None, str | None]:
 def parse_lrc(lrc: str):
     result = []
     for line in lrc.splitlines():
-        m = re.match(r"\[(\d+):(\d+)(?:\.(\d+))?\](.*)", line.strip())
+        m = re.match(r"\[(\d+):(\d+)(?:[.:](\d+))?\](.*)", line.strip())
         if m:
-            ms = (int(m.group(1)) * 60 + int(m.group(2))) * 1000 + int(m.group(3) or 0) * 10
+            frac = (m.group(3) or "0")[:3].ljust(3, "0")
+            ms = (int(m.group(1)) * 60 + int(m.group(2))) * 1000 + int(frac)
             text = m.group(4).strip()
             if text:
                 result.append((text, ms))
@@ -608,7 +672,7 @@ def parse_lrc(lrc: str):
 
 
 def embed_lyrics_to_file(mp3_path: str, plain: str | None, synced: str | None, title: str = "", artist: str = "") -> str:
-    """Embed lyrics into mp3 tags and manage missing_lyrics.json."""
+    """Embed lyrics into mp3 tags (and sidecar .lrc for synced lyrics) and manage missing_lyrics.json."""
     if not MUTAGEN:
         return "⚠️ mutagen not installed"
     if not os.path.exists(mp3_path):
@@ -624,9 +688,12 @@ def embed_lyrics_to_file(mp3_path: str, plain: str | None, synced: str | None, t
         except ID3NoHeaderError:
             tags = ID3()
 
-        if plain:
+        # Navidrome & Subsonic clients read USLT (or sidecar .lrc) for synced LRC timestamps.
+        # Prefer putting synced LRC text in USLT when available, falling back to plain text.
+        uslt_text = synced or plain
+        if uslt_text:
             tags.delall("USLT")
-            tags.add(USLT(encoding=Encoding.UTF8, lang="eng", desc="", text=plain))
+            tags.add(USLT(encoding=Encoding.UTF8, lang="eng", desc="", text=uslt_text))
 
         if synced:
             parsed = parse_lrc(synced)
@@ -634,6 +701,12 @@ def embed_lyrics_to_file(mp3_path: str, plain: str | None, synced: str | None, t
                 tags.delall("SYLT")
                 tags.add(SYLT(encoding=Encoding.UTF8, lang="eng",
                               format=2, type=1, desc="", text=parsed))
+            try:
+                lrc_path = os.path.splitext(mp3_path)[0] + ".lrc"
+                with open(lrc_path, "w", encoding="utf-8") as lrc_f:
+                    lrc_f.write(synced)
+            except Exception:
+                pass
 
         tags.save(mp3_path, v2_version=3)
 
@@ -708,7 +781,7 @@ def process_single_entry(ydl, entry: dict | None) -> dict:
     filename = ydl.prepare_filename(entry)
     mp3_path = os.path.splitext(filename)[0] + ".mp3"
 
-    plain, synced = fetch_lyrics(title, artist)
+    plain, synced = fetch_lyrics(title, artist, mp3_path)
     lyrics_status = embed_lyrics_to_file(mp3_path, plain, synced, title=title, artist=artist)
 
     return {
@@ -720,14 +793,24 @@ def process_single_entry(ydl, entry: dict | None) -> dict:
     }
 
 
-YT_BOT_PHRASES = ["Sign in to confirm", "bot", "cookies", "not a bot", "automated queries", "captcha", "429"]
+YT_BOT_PHRASES = [
+    "Sign in to confirm",
+    "not a bot",
+    "automated queries",
+    "Use --cookies-from-browser or --cookies",
+    "HTTP Error 429",
+    "Too Many Requests",
+]
 
 def _is_yt_blocked(err: str) -> bool:
     return any(p.lower() in err.lower() for p in YT_BOT_PHRASES)
 
 
-def run_single_download(query: str) -> dict:
+def run_single_download(query: str, trigger_scan: bool = True) -> dict:
     import yt_dlp
+
+    if CANCEL_EVENT.is_set():
+        return {"success": False, "error": "Download cancelled"}
 
     query = query.strip()
     url_match = re.search(r"(https?://[^\s]+)", query)
@@ -797,7 +880,8 @@ def run_single_download(query: str) -> dict:
                 return {"success": False, "error": "NO_RESULTS"}
 
             track = process_single_entry(ydl, entry)
-            trigger_navidrome_scan()
+            if trigger_scan:
+                trigger_navidrome_scan()
 
         write_dl_log({
             "type":   "single",
@@ -905,17 +989,18 @@ def run_playlist_download(url: str, progress_cb=None, create_playlist: bool = Tr
         failed_count = 0
         if missing_to_download:
             for idx, t in enumerate(missing_to_download, len(downloaded_tracks) + 1):
+                if CANCEL_EVENT.is_set():
+                    break
                 if progress_cb:
                     progress_cb(idx, total_count, f"Downloading: {t['title']}")
                 target = t.get("url") or (f"https://www.youtube.com/watch?v={t['video_id']}" if t.get("video_id") else f"{t['title']} {t['artist']}")
-                res = run_single_download(target)
+                res = run_single_download(target, trigger_scan=False)
                 if res.get("success"):
                     downloaded_tracks.append(res)
                 else:
                     failed_count += 1
 
-            # 4. Trigger library scan after downloads finish
-            trigger_navidrome_scan()
+            # 4. Trigger library scan once after downloads finish
             navidrome_wait_scan(timeout=90)
 
             # 5. Match newly downloaded tracks in Navidrome
@@ -981,13 +1066,24 @@ async def on_ready():
         print("[PSudofy Bot] WEEKLY_CHANNEL_ID not set — weekly auto-download disabled", flush=True)
 
 
+@bot.check
+async def _restrict_access(ctx) -> bool:
+    """Enforce optional user and channel allowlists from .env."""
+    if ALLOWED_USER_IDS and ctx.author.id not in ALLOWED_USER_IDS:
+        return False
+    if ALLOWED_CHANNEL_IDS and ctx.guild is not None and ctx.channel.id not in ALLOWED_CHANNEL_IDS:
+        return False
+    return True
+
+
 @bot.event
 async def on_command_error(ctx, error):
-    if isinstance(error, commands.CommandNotFound):
-        return  # silently ignore typos like !dls
+    if isinstance(error, (commands.CommandNotFound, commands.CheckFailure)):
+        return  # silently ignore typos or unauthorized callers
+    traceback.print_exception(type(error), error, error.__traceback__)
     embed = discord.Embed(
         title="⚠️ Something went wrong",
-        description=f"```{str(error)[:300]}```",
+        description="An unexpected error occurred while running the command. Please check the server logs.",
         color=0xef4444
     )
     await ctx.reply(embed=embed)
@@ -1069,6 +1165,7 @@ async def _handle_single(ctx, query: str):
     if _download_semaphore is None:
         _download_semaphore = asyncio.Semaphore(MAX_CONCURRENT_DOWNLOADS)
 
+    CANCEL_EVENT.clear()
     msg = await ctx.reply(embed=discord.Embed(
         title="⏳  Fetching Audio & Lyrics…",
         description=(
@@ -1170,6 +1267,7 @@ async def _handle_playlist(ctx, url: str, create_playlist: bool = True, custom_n
 
 
 async def _handle_playlist_inner(ctx, url: str, create_playlist: bool, custom_name: str | None):
+    CANCEL_EVENT.clear()
     source = "Spotify" if is_spotify_url(url) else "YouTube"
     source_emoji = "🟢" if source == "Spotify" else "🔴"
 
@@ -1391,67 +1489,34 @@ async def stats_cmd(ctx):
         ))
 
 
-@bot.command(name="tunnel", aliases=["url", "link", "cf", "cloudflare"])
-async def tunnel_cmd(ctx):
-    """Retrieve the current Cloudflare tunnel URL for Navidrome."""
-    try:
-        cmd = "sudo journalctl -u cloudflared-navidrome --no-pager | grep -o 'https://[a-zA-Z0-9-]*.trycloudflare.com' | tail -1"
-        res = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=10)
-        url = res.stdout.strip()
+@bot.command(name="url", aliases=["link", "server"])
+async def url_cmd(ctx):
+    """Show the direct Navidrome server URL and Symfonium setup instructions."""
+    public_url = os.getenv("PUBLIC_NAVIDROME_URL") or NAVIDROME_URL
+    if "localhost" in public_url or "127.0.0.1" in public_url:
+        ext_url = os.getenv("EXTERNAL_SERVER_URL", "")
+        if ext_url:
+            host = urllib.parse.urlparse(ext_url).hostname
+            if host:
+                public_url = f"https://{host}:4533"
 
-        # If not found or empty, check service status and try restarting
-        if not url or not url.startswith("https://"):
-            status_res = subprocess.run(["sudo", "systemctl", "is-active", "cloudflared-navidrome"], capture_output=True, text=True)
-            status = status_res.stdout.strip()
-            if status != "active":
-                embed = discord.Embed(
-                    title="⚠️  Cloudflare Tunnel Offline",
-                    description=f"Service status: `{status}`\nRestarting tunnel service...",
-                    color=0xFEE75C
-                )
-                msg = await ctx.reply(embed=embed)
-                subprocess.run(["sudo", "systemctl", "restart", "cloudflared-navidrome"], timeout=15)
-                import asyncio
-                await asyncio.sleep(6)
-                res = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=10)
-                url = res.stdout.strip()
-                if url and url.startswith("https://"):
-                    embed = discord.Embed(
-                        title="🌐  Cloudflare Tunnel URL",
-                        description=f"**Tunnel URL (Bypasses Campus Wi-Fi & Firewalls):**\n`{url}`\n\n🔗 **[Open Navidrome Web UI]({url}/app/)**",
-                        color=0x57F287
-                    )
-                    embed.add_field(
-                        name="📱 Symfonium Setup",
-                        value=f"1. Open Symfonium ➔ **Settings (⚙️)** ➔ **Media providers**\n2. Tap your server ➔ **Edit**\n3. Set Server URL: `{url}`\n4. Save and Sync!",
-                        inline=False
-                    )
-                    embed.set_footer(text="PSudofy  •  Cloudflare Tunnel  •  Works on any network")
-                    await msg.edit(embed=embed)
-                    return
-                else:
-                    embed.description = "❌ Tunnel could not be started or URL not found in logs."
-                    embed.color = 0xED4245
-                    await msg.edit(embed=embed)
-                    return
-
-        if url and url.startswith("https://"):
-            embed = discord.Embed(
-                title="🌐  Cloudflare Tunnel URL",
-                description=f"**Tunnel URL (Bypasses Campus Wi-Fi & Firewalls):**\n`{url}`\n\n🔗 **[Open Navidrome Web UI]({url}/app/)**",
-                color=0x57F287
-            )
-            embed.add_field(
-                name="📱 Symfonium Setup",
-                value=f"1. Open Symfonium ➔ **Settings (⚙️)** ➔ **Media providers**\n2. Tap your server ➔ **Edit**\n3. Set Server URL: `{url}`\n4. Save and Sync!",
-                inline=False
-            )
-            embed.set_footer(text="PSudofy  •  Cloudflare Tunnel  •  Works on any network")
-            await ctx.reply(embed=embed)
-        else:
-            await ctx.reply("❌ Could not extract Cloudflare Tunnel URL. Check if `cloudflared-navidrome` service is running.")
-    except Exception as e:
-        await ctx.reply(f"❌ Error getting tunnel URL: `{e}`")
+    embed = discord.Embed(
+        title="🌐  PSudofy Server URL",
+        description=f"**Server URL:**\n`{public_url}`\n\n🔗 **[Open Navidrome Web UI]({public_url}/app/)**",
+        color=0x57F287
+    )
+    embed.add_field(
+        name="📱 Symfonium Setup",
+        value=(
+            "1. Open Symfonium ➔ **Settings (⚙️)** ➔ **Media providers**\n"
+            "2. Tap your server ➔ **Edit**\n"
+            f"3. Set Server URL: `{public_url}`\n"
+            "4. Save and Sync!"
+        ),
+        inline=False
+    )
+    embed.set_footer(text="PSudofy  •  Direct Server Connection")
+    await ctx.reply(embed=embed)
 
 
 @bot.command(name="log", aliases=["logs", "history", "recent"])
@@ -1587,20 +1652,22 @@ async def retryfailed_cmd(ctx):
         fixed = 0
         failed_again = 0
         for idx, item in enumerate(items, 1):
+            if CANCEL_EVENT.is_set():
+                break
             query = item.get("query", "").strip()
             if not query:
                 continue
             progress_cb(idx, total, query)
-            res = run_single_download(query)
+            res = run_single_download(query, trigger_scan=False)
             if res.get("success"):
                 fixed += 1
             else:
                 failed_again += 1
         if fixed > 0:
-            trigger_navidrome_scan()
             navidrome_wait_scan(timeout=60)
         return fixed, failed_again
 
+    CANCEL_EVENT.clear()
     retry_task = loop.run_in_executor(None, do_retry)
     ACTIVE_TASKS.add(retry_task)
 
@@ -1720,7 +1787,7 @@ async def retrylyrics_cmd(ctx):
             path   = item.get("path",   "")
             if not path or not os.path.exists(path):
                 continue
-            plain, synced = fetch_lyrics(title, artist)
+            plain, synced = fetch_lyrics(title, artist, path)
             if plain or synced:
                 st = embed_lyrics_to_file(path, plain, synced, title=title, artist=artist)
                 if "✅" in st:
@@ -1990,17 +2057,20 @@ async def dlrecs_cmd(ctx):
         success_tracks = []
         failed_count = 0
         for idx, r in enumerate(recs_to_dl, 1):
+            if CANCEL_EVENT.is_set():
+                break
             progress_cb(idx, total, r.get("title", "Song"))
             target = r.get("url") or f"{r['title']} {r['artist']}"
-            res = run_single_download(target)
+            res = run_single_download(target, trigger_scan=False)
             if res.get("success"):
                 success_tracks.append(res)
             else:
                 failed_count += 1
-        trigger_navidrome_scan()
-        navidrome_wait_scan(timeout=60)
+        if success_tracks:
+            navidrome_wait_scan(timeout=60)
         return success_tracks, failed_count
 
+    CANCEL_EVENT.clear()
     dl_task = loop.run_in_executor(None, do_download)
     ACTIVE_TASKS.add(dl_task)
 
@@ -2435,14 +2505,15 @@ async def weekly_autodl():
     def do_weekly_download():
         nonlocal failed_count
         for r in recs:
+            if CANCEL_EVENT.is_set():
+                break
             target = r.get("url") or f"{r['title']} {r['artist']}"
-            res = run_single_download(target)
+            res = run_single_download(target, trigger_scan=False)
             if res.get("success"):
                 success_tracks.append(res)
             else:
                 failed_count += 1
         if success_tracks:
-            trigger_navidrome_scan()
             navidrome_wait_scan(timeout=60)
 
     await loop.run_in_executor(None, do_weekly_download)
@@ -2762,7 +2833,7 @@ async def help_cmd(ctx):
             "`!stats` — song / artist / album / playlist counts\n"
             "`!scan` — force Navidrome to pick up new files\n"
             "`!smartplaylist` — generate smart themed playlists from your library\n"
-            "`!tunnel` (or `!url`) — get active Cloudflare URL to bypass campus firewalls"
+            "`!url` (or `!link`) — get the Navidrome server URL and Symfonium setup guide"
         ),
         inline=False
     )

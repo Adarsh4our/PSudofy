@@ -135,7 +135,7 @@ def parse_lrc(lrc: str):
 
 def embed_lyrics(mp3_path: Path, plain: Optional[str], synced: Optional[str]) -> bool:
     """
-    Embed lyrics into the MP3 file's ID3 tags.
+    Embed lyrics into the MP3 file's ID3 tags (and write sidecar .lrc for synced lyrics).
     Returns True on success.
     """
     try:
@@ -144,13 +144,14 @@ def embed_lyrics(mp3_path: Path, plain: Optional[str], synced: Optional[str]) ->
         except ID3NoHeaderError:
             tags = ID3()
 
-        if plain:
+        uslt_text = synced or plain
+        if uslt_text:
             tags.delall("USLT")
             tags.add(USLT(
                 encoding=Encoding.UTF8,
                 lang="eng",
                 desc="",
-                text=plain
+                text=uslt_text
             ))
 
         if synced:
@@ -165,10 +166,15 @@ def embed_lyrics(mp3_path: Path, plain: Optional[str], synced: Optional[str]) ->
                     desc="",
                     text=parsed
                 ))
+            try:
+                lrc_path = mp3_path.with_suffix(".lrc")
+                lrc_path.write_text(synced, encoding="utf-8")
+            except Exception:
+                pass
 
-        tags.save(str(mp3_path))
+        tags.save(str(mp3_path), v2_version=3)
         return True
-    except Exception as e:
+    except Exception:
         return False
 
 

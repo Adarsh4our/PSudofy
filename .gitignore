@@ -78,3 +78,6 @@ env/
 .DS_Store
 Thumbs.db
 desktop.ini
+scratch/
+brag-output*/
+token-bucket/
